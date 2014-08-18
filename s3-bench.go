@@ -8,9 +8,13 @@ import (
 	"io/ioutil"
 	"log"
 	"math/rand"
+	"net/http"
+	"net/http/httputil"
+	"regexp"
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/rlmcpherson/s3gof3r"
 	"launchpad.net/goamz/aws"
 	"launchpad.net/goamz/s3"
 )
@@ -19,11 +23,15 @@ var (
 	payloadSize int64
 	fileName    string = "random.dat"
 	testRuns    int
+	filter      string
+	cleanup     bool
 )
 
 func main() {
 	flag.IntVar(&testRuns, "runs", 3, "the number of times to run each test")
-	flag.Int64Var(&payloadSize, "payload", 512, "kbytes to use as payload")
+	flag.Int64Var(&payloadSize, "payload", 5000, "kbytes to use as payload")
+	flag.StringVar(&filter, "filter", ".", "a pattern to use to filter region names")
+	flag.BoolVar(&cleanup, "cleanup", true, "whether to remove buckets after tests")
 	flag.Parse()
 
 	// payloadSize is initially in KB
@@ -42,19 +50,30 @@ func main() {
 
 	log.Printf("Generated %s of payload",
 		humanize.Bytes(uint64(payload.Len())))
-
 	log.Printf("Running %d iterations per region",
 		testRuns)
 
+	re := regexp.MustCompile(filter)
+
 	for _, region := range aws.Regions {
-		log.Printf("Testing region %s", region.Name)
+		if re.MatchString(region.Name) {
+			log.Printf("Testing region %s", region.Name)
 
-		suffix := fmt.Sprintf("%d", time.Now().Nanosecond())
-		bucket := bucket(suffix, region)
-		defer cleanup(bucket)
+			suffix := fmt.Sprintf("%d", time.Now().Nanosecond())
+			bucket, err := bucket(suffix, region)
+			if err != nil {
+				log.Println(err)
+				continue
+			}
 
-		benchPut(payload.Bytes(), bucket)
-		benchGet(bucket)
+			if cleanup {
+				defer deleteBucket(bucket)
+			}
+
+			benchPut(payload.Bytes(), bucket)
+			benchGet(bucket)
+			benchParallelGet(bucket)
+		}
 	}
 }
 
@@ -70,7 +89,7 @@ func (r *randomData) Read(p []byte) (n int, err error) {
 }
 
 // bucket creates a random bucket in the given region
-func bucket(suffix string, region aws.Region) *s3.Bucket {
+func bucket(suffix string, region aws.Region) (*s3.Bucket, error) {
 	auth, err := aws.EnvAuth()
 	if err != nil {
 		panic(err)
@@ -82,11 +101,11 @@ func bucket(suffix string, region aws.Region) *s3.Bucket {
 
 	if err := bucket.PutBucket(s3.Private); err != nil {
 		if err.(*s3.Error).StatusCode != 409 {
-			panic(err)
+			return nil, err
 		}
 	}
 
-	return bucket
+	return bucket, nil
 }
 
 func benchPut(payload []byte, bucket *s3.Bucket) error {
@@ -95,10 +114,11 @@ func benchPut(payload []byte, bucket *s3.Bucket) error {
 	for i := 0; i < testRuns; i++ {
 		err := bucket.PutReader(
 			fileName, bytes.NewReader(payload),
-			int64(len(payload)), "application/binary", s3.Private)
+			int64(len(payload)), "application/binary", s3.PublicRead)
 		if err != nil {
 			return err
 		}
+		log.Printf("Wrote %s", bucket.URL(fileName))
 	}
 
 	blen := payloadSize * int64(testRuns)
@@ -127,13 +147,62 @@ func benchGet(bucket *s3.Bucket) error {
 	dur := time.Now().Sub(ts)
 	kSpeed := float64(blen) / dur.Seconds() / float64(1024)
 
-	log.Printf("Read %s in %s (%.4fk/s)",
+	log.Printf("Read (in serial) %s in %s (%.4fk/s)",
 		humanize.Bytes(uint64(blen)), dur, kSpeed)
 
 	return nil
 }
 
-func cleanup(bucket *s3.Bucket) {
+func benchParallelGet(bucket *s3.Bucket) error {
+	// s3gof3r.SetLogger(os.Stderr, "s3gof3r", 0, true)
+
+	k, err := s3gof3r.EnvKeys()
+	if err != nil {
+		return err
+	}
+
+	b := s3gof3r.New("", k).Bucket(bucket.Name)
+	ts := time.Now()
+
+	for i := 0; i < testRuns; i++ {
+		rc, _, err := b.GetReader(fileName, &s3gof3r.Config{
+			Client:      &http.Client{},
+			Concurrency: 5,
+			PartSize:    1000,
+			NTry:        2,
+			Md5Check:    false,
+			Scheme:      "https",
+		})
+		if err != nil {
+			return err
+		}
+		ioutil.ReadAll(rc)
+		rc.Close()
+	}
+
+	blen := payloadSize * int64(testRuns)
+	dur := time.Now().Sub(ts)
+	kSpeed := float64(blen) / dur.Seconds() / float64(1024)
+
+	log.Printf("Read (in parallel) %s in %s (%.4fk/s)",
+		humanize.Bytes(uint64(blen)), dur, kSpeed)
+
+	return nil
+}
+
+func deleteBucket(bucket *s3.Bucket) {
+	log.Printf("Deleting bucket %s", bucket.Name)
 	bucket.Del(fileName)
 	bucket.DelBucket()
+}
+
+type debugTransport struct {
+	http.RoundTripper
+}
+
+func (d *debugTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	b, _ := httputil.DumpRequest(r, false)
+	log.Printf("%s", b)
+
+	return d.RoundTripper.RoundTrip(r)
 }
