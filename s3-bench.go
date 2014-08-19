@@ -8,15 +8,12 @@ import (
 	"io/ioutil"
 	"log"
 	"math/rand"
-	"net/http"
-	"net/http/httputil"
 	"regexp"
+	"runtime"
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/rlmcpherson/s3gof3r"
-	"launchpad.net/goamz/aws"
-	"launchpad.net/goamz/s3"
+	"github.com/lox/s3-bench/s3"
 )
 
 var (
@@ -34,10 +31,10 @@ func main() {
 	flag.BoolVar(&cleanup, "cleanup", true, "whether to remove buckets after tests")
 	flag.Parse()
 
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
 	// payloadSize is initially in KB
 	payloadSize = payloadSize * int64(1024)
-
-	s3.RetryAttempts(true)
 
 	payload := &bytes.Buffer{}
 	payload.Grow(int(payloadSize))
@@ -47,7 +44,6 @@ func main() {
 	}
 
 	io.CopyN(payload, data, payloadSize)
-
 	log.Printf("Generated %s of payload",
 		humanize.Bytes(uint64(payload.Len())))
 	log.Printf("Running %d iterations per region",
@@ -55,7 +51,7 @@ func main() {
 
 	re := regexp.MustCompile(filter)
 
-	for _, region := range aws.Regions {
+	for _, region := range s3.Regions {
 		if re.MatchString(region.Name) {
 			log.Printf("Testing region %s", region.Name)
 
@@ -67,12 +63,29 @@ func main() {
 			}
 
 			if cleanup {
-				defer deleteBucket(bucket)
+				defer func() {
+					bucket.Del(fileName)
+					bucket.Del()
+				}()
 			}
 
-			benchPut(payload.Bytes(), bucket)
-			benchGet(bucket)
-			benchParallelGet(bucket)
+			if err := benchPut(payload.Bytes(), bucket); err != nil {
+				log.Fatal(err)
+			}
+
+			if err := benchGet(bucket); err != nil {
+				log.Fatal(err)
+			}
+
+			if err := benchMultiGet(bucket); err != nil {
+				log.Fatal(err)
+			}
+
+			if cleanup {
+				bucket.Del(fileName)
+				bucket.Del()
+			}
+
 		}
 	}
 }
@@ -89,20 +102,14 @@ func (r *randomData) Read(p []byte) (n int, err error) {
 }
 
 // bucket creates a random bucket in the given region
-func bucket(suffix string, region aws.Region) (*s3.Bucket, error) {
-	auth, err := aws.EnvAuth()
-	if err != nil {
-		panic(err)
+func bucket(suffix string, reg s3.Region) (*s3.Bucket, error) {
+	bucket := &s3.Bucket{
+		Name:   fmt.Sprintf("s3-bench-%s-%s", reg.Name, suffix),
+		Region: reg,
 	}
 
-	conn := s3.New(auth, region)
-	bucket := conn.Bucket(fmt.Sprintf("s3-bench-%s-%s",
-		region.Name, suffix))
-
-	if err := bucket.PutBucket(s3.Private); err != nil {
-		if err.(*s3.Error).StatusCode != 409 {
-			return nil, err
-		}
+	if err := bucket.Create(); err != nil {
+		return nil, err
 	}
 
 	return bucket, nil
@@ -112,10 +119,7 @@ func benchPut(payload []byte, bucket *s3.Bucket) error {
 	ts := time.Now()
 
 	for i := 0; i < testRuns; i++ {
-		err := bucket.PutReader(
-			fileName, bytes.NewReader(payload),
-			int64(len(payload)), "application/binary", s3.PublicRead)
-		if err != nil {
+		if err := bucket.Put(fileName, payload, "public-read"); err != nil {
 			return err
 		}
 		log.Printf("Wrote %s", bucket.URL(fileName))
@@ -135,11 +139,11 @@ func benchGet(bucket *s3.Bucket) error {
 	ts := time.Now()
 
 	for i := 0; i < testRuns; i++ {
-		rc, err := bucket.GetReader(fileName)
+		rc, err := bucket.Get(fileName)
 		if err != nil {
 			return err
 		}
-		ioutil.ReadAll(rc)
+		io.Copy(ioutil.Discard, rc)
 		rc.Close()
 	}
 
@@ -153,30 +157,15 @@ func benchGet(bucket *s3.Bucket) error {
 	return nil
 }
 
-func benchParallelGet(bucket *s3.Bucket) error {
-	// s3gof3r.SetLogger(os.Stderr, "s3gof3r", 0, true)
-
-	k, err := s3gof3r.EnvKeys()
-	if err != nil {
-		return err
-	}
-
-	b := s3gof3r.New("", k).Bucket(bucket.Name)
+func benchMultiGet(bucket *s3.Bucket) error {
 	ts := time.Now()
 
 	for i := 0; i < testRuns; i++ {
-		rc, _, err := b.GetReader(fileName, &s3gof3r.Config{
-			Client:      &http.Client{},
-			Concurrency: 5,
-			PartSize:    1000,
-			NTry:        2,
-			Md5Check:    false,
-			Scheme:      "https",
-		})
+		rc, err := bucket.MultiGet(fileName, 4)
 		if err != nil {
 			return err
 		}
-		ioutil.ReadAll(rc)
+		io.Copy(ioutil.Discard, rc)
 		rc.Close()
 	}
 
@@ -188,21 +177,4 @@ func benchParallelGet(bucket *s3.Bucket) error {
 		humanize.Bytes(uint64(blen)), dur, kSpeed)
 
 	return nil
-}
-
-func deleteBucket(bucket *s3.Bucket) {
-	log.Printf("Deleting bucket %s", bucket.Name)
-	bucket.Del(fileName)
-	bucket.DelBucket()
-}
-
-type debugTransport struct {
-	http.RoundTripper
-}
-
-func (d *debugTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	b, _ := httputil.DumpRequest(r, false)
-	log.Printf("%s", b)
-
-	return d.RoundTripper.RoundTrip(r)
 }
